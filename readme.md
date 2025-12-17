@@ -1,4 +1,4 @@
-# VoxelShellProcessor: Point Cloud to Watertight Mesh
+# LotusMesh.py: Point Cloud to Watertight Mesh
 
 A high-performance Python pipeline that converts **Point Cloud Data (.ply)** into clean, **watertight 3D meshes (.obj)**. 
 
