@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import uuid
+import math
 
 def load_obj_direct(filepath):
     """
@@ -73,24 +74,23 @@ def obj_to_cityjson(obj_path, output_path):
         # 2. Check orientation relative to Bounding Box Center
         # Vector from center to face centroid
         face_centroid = (p0 + p1 + p2) / 3.0
-        view_vec = face_centroid - center
         
         # If dot product is negative, normal points INWARD. 
         # We must flip the face to make it CCW (Outward).
-        if np.dot(n_unit, view_vec) < 0:
-            face = face[::-1] # Flip the list of indices
-            n_unit = -n_unit  # Flip normal for semantic check below
-        
-        # --- END ORIENTATION ASSURANCE ---
+        # if np.dot(n_unit, view_vec) < 0:
+        #     face = face[::-1] # Flip the list of indices
+        #     n_unit = -n_unit  # Flip normal for semantic check below
 
+        # --- END ORIENTATION ASSURANCE ---
+        threshold = np.sin(np.radians(5))
         # 3. Semantic Classification (using the corrected normal)
-        # Z component > 0.5 is Roof, < -0.5 is Ground, else Wall
-        if n_unit[2] > 0.5: 
-            s_type = "RoofSurface"
-        elif n_unit[2] < -0.5: 
-            s_type = "GroundSurface"
-        else: 
+        
+        if abs(n_unit[2]) <= threshold: 
             s_type = "WallSurface"
+        elif n_unit[2] > threshold: 
+            s_type = "RoofSurface"
+        else: 
+            s_type = "GroundSurface"
             
         # 4. Add to lists
         surfaces_geometry.append([face]) 
@@ -145,4 +145,4 @@ def obj_to_cityjson(obj_path, output_path):
     print(f" - Valid Surfaces: {len(surfaces_geometry)}")
 
 # Usage
-obj_to_cityjson("final_building_mesh_hipped.obj", "output_oriented.city.json")
+obj_to_cityjson("final_building_mesh_flat.obj", "output_oriented.city.json")
