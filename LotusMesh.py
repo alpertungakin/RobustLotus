@@ -68,7 +68,6 @@ class LotusMesh:
         self.voxel_centers = None
         self.remaining_voxel_grid = None
         self.voxel_mesh = None
-        self.smoothed_mesh = None
         
         # Load data immediately
         self.load_ply()
@@ -89,13 +88,9 @@ class LotusMesh:
         # Step 1: Compute bounding box
         rotated = self.points_rotated
         voxel_size = self.voxel_size
-        
+
         min_bound = rotated.min(axis=0)
         max_bound = rotated.max(axis=0)
-
-        # Optional: Oriented bounding box
-        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(rotated))
-        obb = pcd.get_oriented_bounding_box()
 
         # Step 2: Fill bounding box with voxels
         x = np.arange(min_bound[0], max_bound[0], voxel_size)
@@ -105,20 +100,19 @@ class LotusMesh:
         xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
         self.voxel_centers = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
 
-        # Step 3: Create voxel cubes for visualization
-        sphere_radius = voxel_size*1.5 # Radius of spheres around each point
+        # Step 3: Filter voxels
+        sphere_radius = voxel_size * 1.5
         sphere_centers = rotated
 
-        # Chunked filtering
         print("Filtering voxels (JIT)...")
         mask = self._filter_voxels_outside_spheres_jit(self.voxel_centers, sphere_centers, sphere_radius)
         remaining_voxels = self.voxel_centers[~mask]
-        
+
         # Create VoxelGrid object
         pcd_temp = o3d.geometry.PointCloud()
         pcd_temp.points = o3d.utility.Vector3dVector(remaining_voxels)
         self.remaining_voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
-            pcd_temp, 
+            pcd_temp,
             voxel_size=voxel_size
         )
         
@@ -206,46 +200,6 @@ class LotusMesh:
 
         self.voxel_mesh = voxel_mesh
         return voxel_mesh
-
-    def smooth(self, method='laplacian', iterations=5, strength=0.7):
-        print("Smoothing mesh...")
-        # Logic from your 'smooth_voxel_mesh'
-        mesh = self.voxel_mesh
-        if method == 'taubin':
-            smoothed = mesh.filter_smooth_taubin(
-                number_of_iterations=iterations,
-                lambda_filter=strength, 
-                mu=-strength
-            )
-        elif method == 'laplacian':
-            smoothed = mesh.filter_smooth_laplacian(
-                number_of_iterations=iterations,
-                lambda_filter=strength 
-            )
-        else:
-            raise ValueError("Method must be 'taubin' or 'laplacian'")
-        
-        smoothed.compute_vertex_normals()
-        self.smoothed_mesh = smoothed
-        
-        # Logic for OBB visualization included in your snippet
-        original_obb = self.voxel_mesh.get_oriented_bounding_box()
-        original_obb.color = (0, 1, 0)
-        padding = 0.1
-        new_extent = original_obb.extent + (padding * 2)
-        expanded_obb = o3d.geometry.OrientedBoundingBox(
-            original_obb.center,
-            original_obb.R,
-            new_extent
-        )
-        expanded_obb.color = (1, 0, 0)
-        
-        # Update normals
-        self.voxel_mesh.compute_triangle_normals()
-        self.smoothed_mesh.compute_triangle_normals()
-        
-        # Just storing this OBB for potential external use like in your snippet
-        self.expanded_obb = expanded_obb 
 
     # --- Static / Utility Methods from snippet ---
 
@@ -343,65 +297,171 @@ class LotusMesh:
         """Runs the sequential flow and returns the final Trimesh object."""
         # 1. Generate & Filter
         self.generate_and_filter_voxels()
-        
+
         # 2. Triangulate
         self.triangulate()
-        
+
         # 3. Ray Intersection (Shell Calculation)
-        # Force normal calculation before raycasting
         self.voxel_mesh.compute_triangle_normals()
         final_indices = self.perform_ray_intersection()
-        
-        # --- VERBOSE OUTPUT ---
         print(f"Indices determined to be internal (common elements): {len(final_indices)}")
-        # ----------------------
-        
+
         # 4. Remove Internal Faces
         self.voxel_mesh.remove_triangles_by_index(final_indices)
         self.voxel_mesh.remove_unreferenced_vertices()
-        
-        # 5. Smooth
-        self.smooth(method='taubin', iterations=10, strength=0.6)
-        
-        # 6. Final Conversion
+
+        # 5. Final Conversion
         print("Converting to Trimesh for final output...")
-        final_trimesh = self.o3d_to_trimesh(self.smoothed_mesh)
-        
+        final_trimesh = self.o3d_to_trimesh(self.voxel_mesh)
+
         # --- REPAIR BLOCK ---
-        # 1. Merge vertices closer than a tiny tolerance (fixes micro-tears from smoothing)
         final_trimesh.merge_vertices(merge_tex=True, merge_norm=True)
-        
-        # 2. Remove degenerate faces (zero area triangles caused by smoothing)
         final_trimesh.update_faces(final_trimesh.nondegenerate_faces())
-        
-        # 3. Remove duplicate faces
         final_trimesh.update_faces(final_trimesh.unique_faces())
-        
-        # 4. Fix normals/winding
         trimesh.repair.fix_inversion(final_trimesh)
         trimesh.repair.fix_winding(final_trimesh)
-        
-        # 5. Fill invisible holes (e.g., missing single triangles)
-        # This is the "Magic Wand" for watertightness
         trimesh.repair.fill_holes(final_trimesh)
-        
+
+
+        # 6. Decimate
+        final_trimesh = self.decimate(final_trimesh)
+
+        # 7. Surface Generalization
+        final_trimesh = self.generalize_surface(final_trimesh, smooth_iterations=10)
+        final_trimesh = self.decimate(final_trimesh)
+
         # Verbose Status
         is_watertight = final_trimesh.is_watertight
         print("-" * 30)
         print(f"FINAL MESH STATUS:")
-        print(f"Vertices:   {len(final_trimesh.vertices)}")
-        print(f"Faces:      {len(final_trimesh.faces)}")
-        print(f"Watertight: {is_watertight}")
-        print(f"Volume:     {final_trimesh.volume:.4f}" if is_watertight else "Volume:     N/A")
+        print(f"  Vertices:   {len(final_trimesh.vertices)}")
+        print(f"  Faces:      {len(final_trimesh.faces)}")
+        print(f"  Watertight: {is_watertight}")
+        print(f"  Volume:     {final_trimesh.volume:.4f}" if is_watertight else "  Volume:     N/A")
         print("-" * 30)
-        
         return final_trimesh
+
+    def generalize_surface(self, mesh, smooth_iterations=10):
+        """
+        Two-pass surface generalization to eliminate shark teeth on walls
+        and stair stepping on slanted roofs.
+
+        Pass 1 — Taubin smoothing:
+            Alternating positive/negative Laplacian steps suppress high-frequency
+            noise (shark teeth, stair-step quantization) without the volume
+            shrinkage of plain Laplacian smoothing.
+
+        Pass 2 — Interior plane snapping:
+            For each connected coplanar region (mesh.facets), fits a least-squares
+            plane via SVD to the smoothed geometry and projects interior vertices
+            back onto it. Interior means every adjacent face of that vertex belongs
+            to the same coplanar region — boundary vertices (shared with a
+            neighbouring wall or roof facet) are never moved, which preserves
+            sharp feature edges and keeps the mesh watertight.
+        """
+        # --- Pass 1: Taubin Smoothing ---
+        print(f"Generalizing surface (Taubin ×{smooth_iterations} + plane snap)...")
+        o3d_mesh = o3d.geometry.TriangleMesh()
+        o3d_mesh.vertices  = o3d.utility.Vector3dVector(mesh.vertices)
+        o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
+        o3d_mesh = o3d_mesh.filter_smooth_taubin(
+            number_of_iterations=smooth_iterations,
+            lambda_filter=0.2,
+            mu=-0.22          # standard Taubin mu: prevents shrinkage
+        )
+
+        verts = np.asarray(o3d_mesh.vertices).copy()
+        faces = np.asarray(o3d_mesh.triangles)
+        smoothed = trimesh.Trimesh(vertices=verts, faces=faces)
+
+        # --- Pass 2: Interior Plane Snapping ---
+        # Precompute vertex → set of adjacent face indices (needed for interior check)
+        v_to_faces = [set() for _ in range(len(verts))]
+        for fi, f in enumerate(faces):
+            for v in f:
+                v_to_faces[v].add(fi)
+
+        for facet in smoothed.facets:
+            if len(facet) < 2:
+                continue
+            facet_set     = set(facet.tolist())
+            facet_vert_idx = np.unique(faces[facet])
+            pts           = verts[facet_vert_idx]
+
+            # Fit plane: eigenvector of smallest singular value = plane normal
+            centroid = pts.mean(axis=0)
+            _, _, Vt = np.linalg.svd(pts - centroid, full_matrices=False)
+            plane_n  = Vt[-1]
+
+            # Snap only interior vertices to eliminate in-plane noise.
+            # Boundary vertices stay put to keep shared edges exact.
+            for vi in facet_vert_idx:
+                if v_to_faces[vi].issubset(facet_set):
+                    p = verts[vi]
+                    verts[vi] = p - np.dot(p - centroid, plane_n) * plane_n
+
+        out = trimesh.Trimesh(vertices=verts, faces=faces)
+        trimesh.repair.fix_winding(out)
+
+        print("-" * 30)
+        print(f"GENERALIZATION STATUS:")
+        print(f"  Smooth iterations: {smooth_iterations}")
+        print(f"  Watertight:        {out.is_watertight}")
+        print("-" * 30)
+
+        return out
+
+    def decimate(self, mesh, percent_target=0.25):
+        """
+        Reduce face count using Open3D's quadric decimation.
+        Repair passes run before and after to guard watertightness.
+        """
+        # Pre-decimation repair
+        if not mesh.is_watertight:
+            print("Pre-decimation repair: filling holes and fixing winding...")
+            trimesh.repair.fill_holes(mesh)
+            trimesh.repair.fix_inversion(mesh)
+            trimesh.repair.fix_winding(mesh)
+
+        faces_before = len(mesh.faces)
+        target_faces = max(int(faces_before * percent_target), 4)
+        print(f"Decimating: {faces_before:,} → target {target_faces:,} ({percent_target*100:.0f}%)")
+
+        # Convert to O3D, decimate, convert back
+        o3d_mesh = o3d.geometry.TriangleMesh()
+        o3d_mesh.vertices  = o3d.utility.Vector3dVector(mesh.vertices)
+        o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
+        o3d_mesh.compute_vertex_normals()
+        o3d_simplified = o3d_mesh.simplify_quadric_decimation(
+            target_number_of_triangles=target_faces
+        )
+        out = trimesh.Trimesh(
+            vertices=np.asarray(o3d_simplified.vertices),
+            faces=np.asarray(o3d_simplified.triangles),
+        )
+
+        # Post-decimation repair
+        if not out.is_watertight:
+            print("Post-decimation repair: fixing artifacts...")
+            trimesh.repair.fill_holes(out)
+            trimesh.repair.fix_inversion(out)
+            trimesh.repair.fix_winding(out)
+
+        print("-" * 30)
+        print(f"DECIMATION STATUS:")
+        print(f"  Faces before: {faces_before:,}")
+        print(f"  Faces after:  {len(out.faces):,}")
+        print(f"  Reduction:    {100 * (1 - len(out.faces) / faces_before):.1f}%")
+        print(f"  Watertight:   {out.is_watertight}")
+        print("-" * 30)
+
+        return out
 
 # --- Usage ---
 if __name__ == "__main__":
     # Ensure this matches your actual file name
-    PLY_FILE = "lod2_concave_building_hipped.ply"
-    VOXEL_SIZE = 0.05
+    PLY_FILE = "bag_0518100001637360_points.ply"
+    VOXEL_SIZE = 1
     
     if os.path.exists(PLY_FILE):
         processor = LotusMesh(PLY_FILE, voxel_size=VOXEL_SIZE)
@@ -410,13 +470,13 @@ if __name__ == "__main__":
         final_mesh = processor.execute()
         
         # Export or Visualize
-        output_filename = "final_building_mesh.obj"
+        output_filename = "bag_0518100001637360_points.obj"
         final_mesh.export(output_filename)
         print(f"Mesh saved to {output_filename}")
         
         # Optional: Visualize using Trimesh's native viewer
         print("Opening Open3D Viewer...")
-        final_o3d = processor.smoothed_mesh
+        final_o3d = processor.voxel_mesh
         final_o3d.compute_vertex_normals()
         final_o3d.paint_uniform_color([0.7, 0.7, 0.7]) # nice grey
         o3d.visualization.draw_geometries([final_o3d], mesh_show_wireframe=True)

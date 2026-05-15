@@ -74,6 +74,106 @@ def refine_ground_vs_ceiling(candidates, semantics_list, gap_threshold=0.5):
     else:
         print(f"   [Clustering] No significant vertical gap detected (Max gap: {max_gap:.2f}m). Keeping all as Ground.")
 
+def build_face_adjacency(faces):
+    """
+    Returns a dict: face_index → set of neighbouring face indices.
+    Two faces are neighbours if they share a directed edge (i.e. an edge
+    stored as a sorted vertex-index pair appears in both face edge lists).
+    """
+    edge_to_faces = {}
+    for fi, face in enumerate(faces):
+        n = len(face)
+        for i in range(n):
+            edge = tuple(sorted((face[i], face[(i + 1) % n])))
+            edge_to_faces.setdefault(edge, []).append(fi)
+
+    adjacency = {i: set() for i in range(len(faces))}
+    for neighbours in edge_to_faces.values():
+        for a in neighbours:
+            for b in neighbours:
+                if a != b:
+                    adjacency[a].add(b)
+    return adjacency
+
+
+def reclassify_surrounded_by_roof(faces, semantics_list):
+    """
+    For every WallSurface or OuterCeiling face, check all edge-sharing
+    neighbours. If every neighbour that has a non-wall classification is
+    a RoofSurface, reclassify this face as RoofSurface too.
+
+    Rationale: after decimation and smoothing, steeply-sloped roof
+    triangles near ridge lines or eave edges can end up classified as
+    walls or outer ceilings because their normal tips just past the
+    vertical threshold. Checking the local neighbourhood corrects these
+    isolated misclassifications without touching actual walls.
+
+    Iterates until no more changes occur (cascades through chains of
+    misclassified faces that border each other before reaching true roof).
+    """
+    TARGETS   = {"WallSurface", "OuterCeiling"}
+    ROOF      = "RoofSurface"
+    adjacency = build_face_adjacency(faces)
+
+    original = list(semantics_list)
+
+    total_changed = 0
+    for fi, s_type in enumerate(original):
+        if s_type not in TARGETS:
+            continue
+
+        neighbours = adjacency[fi]
+        if not neighbours:
+            continue
+
+        # At least 2 of the (up to 3) edge-neighbours must be RoofSurface.
+        # All-roof catches fully enclosed faces; 2-of-3 catches faces on the
+        # boundary of a roof region where one edge is a true wall or open border.
+        roof_count = sum(1 for nb in neighbours if original[nb] == ROOF)
+        if roof_count >= 2:
+            semantics_list[fi] = ROOF
+            total_changed += 1
+
+    print(f"   [Neighbour check] {total_changed} faces reclassified to RoofSurface.")
+
+    # Second pass: OuterFloor face, >= 2 WallSurface neighbours → WallSurface.
+    original = list(semantics_list)
+    floor_changed = 0
+    for fi, s_type in enumerate(original):
+        if s_type != "OuterFloor":
+            continue
+
+        neighbours = adjacency[fi]
+        if not neighbours:
+            continue
+
+        wall_count = sum(1 for nb in neighbours if original[nb] == "WallSurface")
+        if wall_count >= 2:
+            semantics_list[fi] = "WallSurface"
+            floor_changed += 1
+
+    print(f"   [Neighbour check] {floor_changed} OuterFloor faces reclassified to WallSurface.")
+
+    # Pass 3: GroundSurface face, >= 2 WallSurface neighbours → WallSurface.
+    original = list(semantics_list)
+    ground_changed = 0
+    for fi, s_type in enumerate(original):
+        if s_type != "GroundSurface":
+            continue
+
+        neighbours = adjacency[fi]
+        if not neighbours:
+            continue
+
+        wall_count = sum(1 for nb in neighbours if original[nb] == "WallSurface")
+        if wall_count >= 2:
+            semantics_list[fi] = "WallSurface"
+            ground_changed += 1
+
+    print(f"   [Neighbour check] {ground_changed} GroundSurface faces reclassified to WallSurface.")
+
+
+
 def obj_to_cityjson(obj_path, output_path):
     print("Loading OBJ (Direct Mode)...")
     verts, faces = load_obj_direct(obj_path)
@@ -141,6 +241,10 @@ def obj_to_cityjson(obj_path, output_path):
     print(f" Analyzing {len(downward_candidates)} downward surfaces for Ground/Ceiling split...")
     refine_ground_vs_ceiling(downward_candidates, surfaces_semantics)
 
+    # --- NEIGHBOUR-BASED ROOF PROMOTION ---
+    print(" Promoting isolated walls/ceilings surrounded by roof...")
+    reclassify_surrounded_by_roof(faces, surfaces_semantics)
+
     # Prepare Semantic Object
     unique_types = sorted(list(set(surfaces_semantics)))
     type_map = {t: i for i, t in enumerate(unique_types)}
@@ -187,4 +291,4 @@ def obj_to_cityjson(obj_path, output_path):
     print(f"Generated {output_path}")
 
 # Usage
-obj_to_cityjson("decimated.obj", "output_oriented.city.json")
+obj_to_cityjson("7981_points.obj", "7981_points.city.json")
