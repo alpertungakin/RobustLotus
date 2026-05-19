@@ -20,18 +20,26 @@ Two modes, one shared processing chain:
   └────────────────────────────────────────────────────────────────────────────┘
 
 All mesh parameters (voxel size, decimation, smoothing, Taubin) and the output
-format/EPSG settings are shared between both modes.
+format/world-info settings are shared between both modes.
 The only difference is the input: an OBJ mesh (Healing) vs. a PLY point cloud
 (Reconstruction).  In Healing mode, an intermediate PLY is written next to the
 input file and fed straight into the LotusMesh stage.
+
+World info (.txt) is read from files produced by JSON2OBJsSaver.  Each .txt
+contains the EPSG code, bounding-box corners, and the CityJSON transform
+(scale + translate) of the original building.  RobustLotus uses these values
+to write a properly georeferenced CityJSON output with compressed integer
+vertices and a correct transform block.
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Standard / third-party imports
 # ──────────────────────────────────────────────────────────────────────────────
+import ast
 import json
 import os
 import queue
+import re
 import threading
 import uuid
 from functools import reduce
@@ -469,8 +477,82 @@ def run_healing_stage(obj_path, voxel_size, log_fn=print):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SECTION 4 ─ OBJ → CityJSON CONVERTER
+#  SECTION 4 ─ WORLD INFO PARSER  +  OBJ → CityJSON CONVERTER
 # ══════════════════════════════════════════════════════════════════════════════
+
+def parse_world_txt(txt_path):
+    """
+    Parse a world-info .txt file produced by JSON2OBJsSaver.
+
+    Expected format (any order, extra lines ignored)::
+
+        Building ID: NL.IMBAG.Pand.0503100000019512
+        ------------------------------
+        EPSG: 28992
+        BBox Min (X, Y, Z): [93230.45999999999, 436818.2, 1.2270000000000003]
+        BBox Max (X, Y, Z): [93337.09, 436938.13, 91.417]
+        CityJSON Transformation: {'scale': [0.001, 0.001, 0.001], 'translate': [92824.468, 436417.288, -7.436]}
+
+    Returns
+    -------
+    dict with keys:
+        epsg      : str            – e.g. "28992"
+        bbox_min  : list[float]    – [xmin, ymin, zmin]
+        bbox_max  : list[float]    – [xmax, ymax, zmax]
+        scale     : list[float]    – CityJSON transform scale
+        translate : list[float]    – CityJSON transform translate
+
+    Raises
+    ------
+    ValueError  if any of the four required fields cannot be parsed.
+    """
+    result = {}
+
+    with open(txt_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+
+            # EPSG: 28992
+            if line.startswith("EPSG:"):
+                result["epsg"] = line.split(":", 1)[1].strip()
+
+            # BBox Min (X, Y, Z): [93230.46, 436818.2, 1.227]
+            elif line.startswith("BBox Min"):
+                m = re.search(r"\[([^\]]+)\]", line)
+                if m:
+                    result["bbox_min"] = [float(x) for x in m.group(1).split(",")]
+
+            # BBox Max (X, Y, Z): [93337.09, 436938.13, 91.417]
+            elif line.startswith("BBox Max"):
+                m = re.search(r"\[([^\]]+)\]", line)
+                if m:
+                    result["bbox_max"] = [float(x) for x in m.group(1).split(",")]
+
+            # CityJSON Transformation: {'scale': [...], 'translate': [...]}
+            elif line.startswith("CityJSON Transformation:"):
+                raw = line.split(":", 1)[1].strip()
+                try:
+                    d = ast.literal_eval(raw)          # safe eval of Python dict
+                    result["scale"]     = [float(v) for v in d["scale"]]
+                    result["translate"] = [float(v) for v in d["translate"]]
+                except Exception as exc:
+                    raise ValueError(
+                        f"Cannot parse 'CityJSON Transformation' line: {exc}"
+                    ) from exc
+
+    missing = [k for k in ("epsg", "bbox_min", "bbox_max", "scale", "translate")
+               if k not in result]
+    if missing:
+        raise ValueError(
+            f"World-info file is missing required fields: {', '.join(missing)}"
+        )
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Helper functions used by obj_to_cityjson
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _load_obj_direct(filepath):
     verts, faces = [], []
@@ -566,8 +648,35 @@ def _reclassify_surrounded_by_roof(faces, semantics_list, log_fn=print):
            f"{ground_chg} GroundSurface → WallSurface.")
 
 
-def obj_to_cityjson(obj_path, output_path, epsg_code="7415", log_fn=print):
-    """Convert an OBJ file to a CityJSON v2.0 file with LOD2 semantics."""
+# ──────────────────────────────────────────────────────────────────────────────
+
+def obj_to_cityjson(obj_path, output_path, epsg_code="7415", log_fn=print,
+                    world_info=None, coord_offset=None):
+    """
+    Convert an OBJ file to a CityJSON v2.0 file with LOD2 semantics.
+
+    Parameters
+    ----------
+    obj_path      : str   – input OBJ (local / processed coordinates)
+    output_path   : str   – destination .city.json
+    epsg_code     : str   – fallback EPSG used when world_info is None
+    log_fn        : callable(str)
+    world_info    : dict | None
+        When provided (parsed from a JSON2OBJsSaver .txt file), contains:
+          - epsg      : str
+          - bbox_min  : [x, y, z]   – real-world minimum of the original building
+          - bbox_max  : [x, y, z]   – real-world maximum
+          - scale     : [sx, sy, sz] – CityJSON transform scale
+          - translate : [tx, ty, tz] – CityJSON transform translate
+        The EPSG and transform block in the output CityJSON are taken from here.
+        Vertices are compressed to integers using scale / translate.
+    coord_offset  : list[float] | None
+        XYZ offset to add to each OBJ vertex *before* compressing.
+        In Healing mode the input OBJ vertices were shifted to the local origin
+        by subtracting bbox_min, so pass bbox_min here to restore real-world
+        positions.  In Reconstruction mode (PLY already in world coords) pass
+        None or [0, 0, 0].
+    """
     log_fn("Loading OBJ for CityJSON conversion...")
     verts, faces = _load_obj_direct(obj_path)
     if len(verts) == 0:
@@ -575,11 +684,43 @@ def obj_to_cityjson(obj_path, output_path, epsg_code="7415", log_fn=print):
         return
 
     log_fn(f"  {len(faces):,} faces loaded.")
-    min_v  = np.min(verts, axis=0)
-    max_v  = np.max(verts, axis=0)
-    extent = [float(min_v[0]), float(min_v[1]), float(min_v[2]),
-              float(max_v[0]), float(max_v[1]), float(max_v[2])]
 
+    # ── Decide coordinate handling ─────────────────────────────────────────
+    if world_info is not None:
+        epsg_code = world_info["epsg"]
+        scale     = np.array(world_info["scale"],     dtype=float)
+        translate = np.array(world_info["translate"], dtype=float)
+        offset    = np.array(coord_offset,            dtype=float) \
+                    if coord_offset is not None else np.zeros(3)
+
+        # Restore real-world coordinates then compress to CityJSON integers
+        real_verts = verts + offset
+        compressed = np.round((real_verts - translate) / scale).astype(int)
+
+        min_rw = real_verts.min(axis=0)
+        max_rw = real_verts.max(axis=0)
+        extent = [float(min_rw[0]), float(min_rw[1]), float(min_rw[2]),
+                  float(max_rw[0]), float(max_rw[1]), float(max_rw[2])]
+
+        out_vertices   = compressed.tolist()
+        transform_block = {
+            "scale"    : world_info["scale"],
+            "translate": world_info["translate"],
+        }
+        log_fn(f"  Using world info → EPSG {epsg_code} | "
+               f"scale {world_info['scale']} | translate {world_info['translate']}")
+        log_fn(f"  Geographical extent: {[round(v, 3) for v in extent]}")
+
+    else:
+        # No world info – fall back to raw float vertices (no transform block)
+        min_v = np.min(verts, axis=0)
+        max_v = np.max(verts, axis=0)
+        extent = [float(min_v[0]), float(min_v[1]), float(min_v[2]),
+                  float(max_v[0]), float(max_v[1]), float(max_v[2])]
+        out_vertices    = verts.tolist()
+        transform_block = None
+
+    # ── Semantic classification ────────────────────────────────────────────
     threshold           = np.sin(np.radians(5))
     surfaces_geometry   = []
     surfaces_semantics  = []
@@ -610,21 +751,22 @@ def obj_to_cityjson(obj_path, output_path, epsg_code="7415", log_fn=print):
     log_fn("Running neighbour-based reclassification...")
     _reclassify_surrounded_by_roof(faces, surfaces_semantics, log_fn=log_fn)
 
+    # ── Assemble CityJSON ──────────────────────────────────────────────────
     unique_types    = sorted(set(surfaces_semantics))
     type_map        = {t: i for i, t in enumerate(unique_types)}
     semantic_values = [type_map[t] for t in surfaces_semantics]
     building_id     = _generate_cityjson_id()
-    height          = float(max_v[2] - min_v[2])
+    height          = float(extent[5] - extent[2])       # max_z - min_z
     epsg_uri        = f"https://www.opengis.net/def/crs/EPSG/0/{epsg_code}"
 
-    cityjson = {
+    cityjson_dict = {
         "type"   : "CityJSON",
         "version": "2.0",
         "metadata": {
             "geographicalExtent": extent,
             "referenceSystem"   : epsg_uri,
         },
-        "vertices": verts.tolist(),
+        "vertices": out_vertices,
         "CityObjects": {
             building_id: {
                 "type": "Building",
@@ -646,8 +788,12 @@ def obj_to_cityjson(obj_path, output_path, epsg_code="7415", log_fn=print):
         },
     }
 
+    # Insert transform block right after "version" when world_info was provided
+    if transform_block is not None:
+        cityjson_dict["transform"] = transform_block
+
     with open(output_path, 'w') as fh:
-        json.dump(cityjson, fh, separators=(',', ':'))
+        json.dump(cityjson_dict, fh, separators=(',', ':'))
     log_fn(f"CityJSON written → {output_path}")
 
 
@@ -661,8 +807,8 @@ class PipelineGUI(tk.Tk):
 
     The mode selector switches only the INPUT row between an OBJ browser
     (Healing) and a PLY browser (Reconstruction).  Every other control —
-    voxel size, mesh parameters, output format, EPSG, and output path — is
-    shared and always visible, because both modes feed into the same
+    voxel size, mesh parameters, output format, world-info file, and output
+    path — is shared and always visible, because both modes feed into the same
     LotusMesh → OBJ / CityJSON chain.
     """
 
@@ -683,9 +829,10 @@ class PipelineGUI(tk.Tk):
         self.title("RobustLotus Pipeline")
         self.configure(bg=self.BG)
         self.resizable(True, True)
-        self.minsize(700, 860)
+        self.minsize(700, 920)
 
-        self._log_queue = queue.Queue()
+        self._log_queue  = queue.Queue()
+        self._world_info = None       # populated when a .txt is successfully parsed
         self._build_ui()
         self._poll_log()
 
@@ -728,7 +875,7 @@ class PipelineGUI(tk.Tk):
 
         ttk.Separator(self).pack(fill="x", padx=12, pady=6)
 
-        # ── Input row (label + path swap on mode change) ───────────────────────
+        # ── Input row (label + path swap on mode change) ──────────────────────
         self._section("Input File")
         self._input_label_var = tk.StringVar(value="Mesh File (.obj)")
         tk.Label(self, textvariable=self._input_label_var,
@@ -787,22 +934,40 @@ class PipelineGUI(tk.Tk):
                            activebackground=self.BG, font=self.FONT
                            ).pack(side="left", padx=10)
 
-        # EPSG (visible for CityJSON only)
-        self._epsg_frame = tk.Frame(self, bg=self.BG)
-        self._epsg_frame.pack(fill="x", **pad)
-        tk.Label(self._epsg_frame, text="CRS EPSG Code:", font=self.FONT_B,
-                 bg=self.BG, fg=self.FG).pack(side="left")
-        self._epsg_var = tk.StringVar(value="7415")
-        tk.Entry(self._epsg_frame, textvariable=self._epsg_var, width=10,
-                 bg=self.ENTRY_BG, fg=self.FG, font=self.FONT,
-                 insertbackground=self.FG, relief="flat"
-                 ).pack(side="left", padx=6)
-        tk.Label(self._epsg_frame,
-                 text="(e.g. 7415 = RD New + NAP, 4326 = WGS84)",
-                 font=("Segoe UI", 9), bg=self.BG, fg="#6c7086"
-                 ).pack(side="left")
+        # ── World info .txt file (shown only for CityJSON output) ─────────────
+        self._world_frame = tk.Frame(self, bg=self.BG)
+        self._world_frame.pack(fill="x", padx=12, pady=(2, 0))
 
-        # Output path
+        # Row 1: label + entry + browse button
+        tk.Label(self._world_frame, text="World Info (.txt from exporter):",
+                 font=self.FONT_B, bg=self.BG, fg=self.FG
+                 ).grid(row=0, column=0, sticky="w", pady=(4, 0))
+
+        self._txt_var = tk.StringVar()
+        self._txt_entry = tk.Entry(
+            self._world_frame, textvariable=self._txt_var,
+            bg=self.ENTRY_BG, fg=self.FG, font=self.FONT,
+            insertbackground=self.FG, relief="flat")
+        self._txt_entry.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+
+        self._txt_btn = tk.Button(
+            self._world_frame, text="Browse…",
+            command=self._browse_txt,
+            bg=self.BTN_BG, fg=self.BTN_FG, font=self.FONT,
+            relief="flat", cursor="hand2")
+        self._txt_btn.grid(row=1, column=1, sticky="w")
+
+        self._world_frame.columnconfigure(0, weight=1)
+
+        # Row 2: parsed-info summary label
+        self._world_info_var = tk.StringVar(
+            value="No file selected — EPSG, extent and transform will not be set.")
+        tk.Label(self._world_frame, textvariable=self._world_info_var,
+                 font=("Segoe UI", 8), bg=self.BG, fg="#6c7086",
+                 wraplength=620, justify="left"
+                 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 4))
+
+        # ── Output path ───────────────────────────────────────────────────────
         out_row = tk.Frame(self, bg=self.BG)
         out_row.pack(fill="x", **pad)
         tk.Label(out_row, text="Output Path:", font=self.FONT_B,
@@ -868,9 +1033,11 @@ class PipelineGUI(tk.Tk):
         self._out_var.set("")
 
     def _on_fmt_change(self):
+        """Show/hide the world-info frame depending on selected output format."""
         vis = self._fmt_var.get() == "cityjson"
-        for child in self._epsg_frame.winfo_children():
-            child.configure(state="normal" if vis else "disabled")
+        state = "normal" if vis else "disabled"
+        for widget in (self._txt_entry, self._txt_btn):
+            widget.configure(state=state)
         inp = self._input_var.get().strip()
         if inp:
             self._auto_output_path(inp)
@@ -899,6 +1066,44 @@ class PipelineGUI(tk.Tk):
             title="Save output as…", filetypes=ft, defaultextension=defext)
         if p:
             self._out_var.set(p)
+
+    def _browse_txt(self):
+        """Open a file dialog to select a world-info .txt and parse it."""
+        p = filedialog.askopenfilename(
+            title="Select world-info .txt (from JSON2OBJsSaver)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if p:
+            self._txt_var.set(p)
+            self._load_world_txt(p)
+
+    def _load_world_txt(self, txt_path):
+        """
+        Parse the selected .txt file and update the info label.
+        Stores the result in self._world_info on success.
+        """
+        try:
+            info = parse_world_txt(txt_path)
+            self._world_info = info
+
+            sc  = info["scale"]
+            tr  = info["translate"]
+            bmn = info["bbox_min"]
+            bmx = info["bbox_max"]
+            summary = (
+                f"EPSG: {info['epsg']}  |  "
+                f"Scale: [{sc[0]}, {sc[1]}, {sc[2]}]  |  "
+                f"Translate: [{tr[0]:.3f}, {tr[1]:.3f}, {tr[2]:.3f}]  |  "
+                f"BBox: [{bmn[0]:.2f}, {bmn[1]:.2f}, {bmn[2]:.2f}] → "
+                f"[{bmx[0]:.2f}, {bmx[1]:.2f}, {bmx[2]:.2f}]"
+            )
+            self._world_info_var.set(summary)
+
+        except Exception as exc:
+            self._world_info = None
+            self._world_info_var.set(f"⚠  Parse error: {exc}")
+            messagebox.showerror(
+                "World-info parse error",
+                f"Could not read world info from:\n{txt_path}\n\n{exc}")
 
     def _auto_output_path(self, input_path):
         """Derive an output path from the input stem and chosen format."""
@@ -932,6 +1137,7 @@ class PipelineGUI(tk.Tk):
     def _run(self):
         input_path = self._input_var.get().strip()
         out_path   = self._out_var.get().strip()
+        fmt        = self._fmt_var.get()
 
         if not input_path:
             messagebox.showerror("Missing input", "Please select an input file.")
@@ -943,9 +1149,21 @@ class PipelineGUI(tk.Tk):
             messagebox.showerror("Missing output", "Please specify an output path.")
             return
 
+        # Validate world-info when CityJSON is the target
+        world_info = self._world_info
+        if fmt == "cityjson" and world_info is None:
+            if not messagebox.askyesno(
+                "No world info",
+                "No world-info .txt has been loaded.\n\n"
+                "The output CityJSON will have no georeference transform,\n"
+                "EPSG will default to 7415, and vertices will be stored\n"
+                "as raw floats without a transform block.\n\n"
+                "Continue anyway?"
+            ):
+                return
+
         mode          = self._mode_var.get()
-        fmt           = self._fmt_var.get()
-        epsg          = self._epsg_var.get().strip() or "7415"
+        epsg          = world_info["epsg"] if world_info else "7415"
         voxel_size    = float(self._voxel_var.get())
         decimate_pc   = float(self._decimate_var.get()) / 100.0
         smooth_iter   = int(self._smooth_var.get())
@@ -957,12 +1175,12 @@ class PipelineGUI(tk.Tk):
             target=self._pipeline_thread,
             args=(mode, input_path, out_path, fmt, epsg,
                   voxel_size, decimate_pc, smooth_iter,
-                  taubin_lambda, taubin_mu),
+                  taubin_lambda, taubin_mu, world_info),
             daemon=True).start()
 
     def _pipeline_thread(self, mode, input_path, out_path, fmt, epsg,
                          voxel_size, decimate_pc, smooth_iter,
-                         taubin_lambda, taubin_mu):
+                         taubin_lambda, taubin_mu, world_info=None):
         try:
             label = "HEALING" if mode == "healing" else "RECONSTRUCTION"
             self._log("=" * 52)
@@ -976,7 +1194,14 @@ class PipelineGUI(tk.Tk):
             self._log(f"  Taubin λ     : {taubin_lambda:.3f}")
             self._log(f"  Taubin μ     : {taubin_mu:.3f}")
             if fmt == "cityjson":
-                self._log(f"  EPSG         : {epsg}")
+                if world_info is not None:
+                    self._log(f"  EPSG         : {world_info['epsg']}  (from world-info .txt)")
+                    self._log(f"  Scale        : {world_info['scale']}")
+                    self._log(f"  Translate    : {world_info['translate']}")
+                    self._log(f"  BBox min     : {world_info['bbox_min']}")
+                    self._log(f"  BBox max     : {world_info['bbox_max']}")
+                else:
+                    self._log(f"  EPSG         : {epsg}  (fallback – no world-info .txt)")
             self._log("=" * 52)
 
             # ── Stage 1 (Healing only): OBJ → ray-cast → intermediate PLY ────
@@ -1014,8 +1239,23 @@ class PipelineGUI(tk.Tk):
 
             # ── Stage 4: CityJSON (optional) ──────────────────────────────────
             if fmt == "cityjson":
+                # In Healing mode, run_healing_stage translates the OBJ to the
+                # local origin by subtracting t_mesh.vertices.min(axis=0).
+                # That minimum equals bbox_min from the world-info .txt.
+                # We pass it as coord_offset so obj_to_cityjson can restore the
+                # real-world positions before compressing to CityJSON integers.
+                # In Reconstruction mode the PLY is assumed to already be in
+                # real-world coordinates, so no offset is needed.
+                if world_info is not None and mode == "healing":
+                    coord_offset = world_info["bbox_min"]
+                else:
+                    coord_offset = None
+
                 obj_to_cityjson(obj_path, out_path,
-                                epsg_code=epsg, log_fn=self._log)
+                                epsg_code=epsg,
+                                log_fn=self._log,
+                                world_info=world_info,
+                                coord_offset=coord_offset)
 
             self._log("=" * 52)
             self._log("✅ PIPELINE COMPLETE")

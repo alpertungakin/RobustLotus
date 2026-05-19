@@ -20,8 +20,11 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────
-#  Core export logic
+#  Helpers
 # ─────────────────────────────────────────────────────────────
+
+LOD2_VALUES = {"2", "2.0", "2.2", "2.3"}
+
 
 def extract_epsg(cm):
     """
@@ -60,29 +63,46 @@ def get_lod2_building_ids(cm):
     """Return IDs of CityObjects that have at least one LOD 2 geometry."""
     ids = []
     for obj_id, city_obj in cm.j.get("CityObjects", {}).items():
-        # Accept building types only (Building, BuildingPart, etc.)
         obj_type = city_obj.get("type", "")
         if "Building" not in obj_type:
             continue
         for geom in city_obj.get("geometry", []):
             lod = str(geom.get("lod", "")).strip()
-            if lod in ("2", "2.0", "2.2", "2.3"):
+            if lod in LOD2_VALUES:
                 ids.append(obj_id)
                 break
     return ids
 
 
+# ─────────────────────────────────────────────────────────────
+#  Core export logic
+# ─────────────────────────────────────────────────────────────
+
 def export_one_building(cm, obj_id, output_dir, epsg, log):
     """
     Export a single building to <obj_id>.obj + <obj_id>.txt.
+    Only LOD2 geometries are written; LOD1 (and any other LoD) is stripped.
     Returns True on success.
     """
     s = cm.transform["scale"]
     t = cm.transform["translate"]
 
     try:
-        # ── Subset & export ────────────────────────────────────
+        # ── Subset ────────────────────────────────────────────
         subset = cm.get_subset_ids([obj_id])
+
+        # ── STRIP NON-LOD2 GEOMETRIES ─────────────────────────
+        # Without this step cjio's export2obj would include every LoD
+        # (LOD1, LOD2, …) present on the object, producing the union mesh
+        # visible in the screenshots.
+        for co in subset.j.get("CityObjects", {}).values():
+            co["geometry"] = [
+                g for g in co.get("geometry", [])
+                if str(g.get("lod", "")).strip() in LOD2_VALUES
+            ]
+
+        # Re-run orphan removal *after* trimming so vertices referenced only
+        # by LOD1 faces are eliminated before export.
         subset.remove_orphan_vertices()
 
         if "transform" not in subset.j:
@@ -145,6 +165,57 @@ def export_one_building(cm, obj_id, output_dir, epsg, log):
     except Exception as exc:
         log(f"  ✗  {obj_id}  →  {exc}")
         return False
+
+
+def delete_empty_obj_files(output_dir, log):
+    """
+    Scan output_dir for .obj files that contain no usable geometry
+    (no vertex lines starting with 'v ' OR no face lines starting with 'f ').
+    Deletes both the .obj and its paired .txt when found.
+    Returns the number of files deleted.
+    """
+    deleted = 0
+    try:
+        entries = [f for f in os.listdir(output_dir)
+                   if f.lower().endswith(".obj")]
+    except OSError:
+        return 0
+
+    for fname in entries:
+        fpath = os.path.join(output_dir, fname)
+        has_vertex = False
+        has_face   = False
+        try:
+            with open(fpath, "r") as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    if stripped.startswith("v "):
+                        has_vertex = True
+                    elif stripped.startswith("f "):
+                        has_face = True
+                    if has_vertex and has_face:
+                        break
+        except Exception:
+            continue  # skip unreadable files
+
+        if not has_vertex or not has_face:
+            try:
+                os.remove(fpath)
+                log(f"  🗑  Deleted (no geometry): {fname}")
+                deleted += 1
+            except OSError as exc:
+                log(f"  ✗  Could not delete {fname}: {exc}")
+
+            # Remove paired .txt if present
+            txt_path = os.path.splitext(fpath)[0] + ".txt"
+            if os.path.isfile(txt_path):
+                try:
+                    os.remove(txt_path)
+                    log(f"  🗑  Deleted paired: {os.path.basename(txt_path)}")
+                except OSError:
+                    pass
+
+    return deleted
 
 
 # ─────────────────────────────────────────────────────────────
@@ -215,34 +286,28 @@ class App(tk.Tk):
 
         # ── Card: file paths ───────────────────────────────────
         card1 = ttk.Frame(self, style="Card.TFrame", padding=14)
-        card1.pack(fill="x", padx=20, pady=4)
+        card1.pack(fill="x", padx=20, pady=(0, 6))
 
-        self._json_var  = tk.StringVar()
+        self._json_var   = tk.StringVar()
         self._outdir_var = tk.StringVar()
 
-        self._path_row(card1, "CityJSON file", self._json_var,
-                       self._browse_json, 0)
-        self._path_row(card1, "Output folder", self._outdir_var,
-                       self._browse_outdir, 1)
+        self._path_row(card1, "CityJSON input file:",
+                       self._json_var,   self._browse_json,   0)
+        self._path_row(card1, "Output folder:",
+                       self._outdir_var, self._browse_outdir, 1)
 
-        # ── Card: options ──────────────────────────────────────
-        card2 = ttk.Frame(self, style="Card.TFrame", padding=14)
-        card2.pack(fill="x", padx=20, pady=4)
-
+        # ── EPSG row ───────────────────────────────────────────
+        epsg_frame = ttk.Frame(self, padding=(20, 4, 20, 0))
+        epsg_frame.pack(fill="x")
+        ttk.Label(epsg_frame, text="Detected EPSG: ",
+                  foreground=MUTED, background=DARK,
+                  font=("Consolas", 9)).pack(side="left")
         self._epsg_detected = tk.StringVar(value="—")
+        ttk.Label(epsg_frame, textvariable=self._epsg_detected,
+                  foreground=BLUE, background=DARK,
+                  font=("Consolas", 9, "bold")).pack(side="left")
 
-        r = ttk.Frame(card2, style="Card.TFrame")
-        r.pack(fill="x")
-
-        # EPSG: read-only display, populated after file load
-        ttk.Label(r, text="EPSG  (auto-detected)", style="Sub.TLabel",
-                  background=MID).grid(row=0, column=0, sticky="w", padx=(0,16))
-        ttk.Label(r, textvariable=self._epsg_detected,
-                  background=MID, foreground=BLUE,
-                  font=("Consolas", 10, "bold")).grid(
-                      row=1, column=0, sticky="w", padx=(0,16))
-
-        # ── Progress / status ──────────────────────────────────
+        # ── Progress ───────────────────────────────────────────
         prog_frame = ttk.Frame(self, padding=(20, 6, 20, 0))
         prog_frame.pack(fill="x")
 
@@ -357,6 +422,8 @@ class App(tk.Tk):
             self._log_ok(msg)
         elif msg.startswith("  ✗"):
             self._log_err(msg)
+        elif msg.startswith("  🗑"):
+            self.after(0, self._append_log, msg, "muted")
         else:
             self._log_info(msg)
 
@@ -436,6 +503,14 @@ class App(tk.Tk):
                 self.after(0, self._progress.configure, {"value": pct})
                 self.after(0, self._status_var.set,
                            f"{i}/{len(ids)}  —  {ok_count} ok")
+
+            # ── Post-export: clean up files with no geometry ───
+            self._log_info("\nChecking for empty output files…")
+            deleted = delete_empty_obj_files(output_dir, self._log_any)
+            if deleted:
+                self._log_info(f"Removed {deleted} empty file(s).")
+            else:
+                self._log_info("No empty files found.")
 
             self._log_info(
                 f"\nDone.  {ok_count}/{len(ids)} buildings exported"
