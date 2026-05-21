@@ -133,24 +133,44 @@ class LotusMesh:
         self.points_rotated = np.asarray(self.pcd_in.points)
         self.log(f"  {len(self.points_rotated):,} points loaded.")
 
-    # ── Voxelisation ──────────────────────────────────────────────────────────
+ # ── Voxelisation ──────────────────────────────────────────────────────────
 
     def generate_and_filter_voxels(self):
-        rotated = self.points_rotated
+        # --- EKLENEN KISIM: Sadece XY düzleminde Axis-Aligned Voxelizasyon için PCA ---
+        pts_xy = self.points_rotated[:, :2]
+        centroid_xy = np.mean(pts_xy, axis=0)
+        centered = pts_xy - centroid_xy
+        cov = np.cov(centered, rowvar=False)
+        evals, evecs = np.linalg.eigh(cov)
+        
+        # Sağ elli koordinat sistemi için determinant kontrolü
+        if np.linalg.det(evecs) < 0:
+            evecs[:, 1] = -evecs[:, 1]
+            
+        R_2d = evecs.T  # PCA bileşenlerini eksenlere hizalayacak rotasyon matrisi
+        
+        self.R_align = np.eye(3)
+        self.R_align[:2, :2] = R_2d
+        self.align_centroid = np.array([centroid_xy[0], centroid_xy[1], 0.0])
+        
+        # Noktaları ağırlık merkezine çek ve sadece XY düzleminde döndür
+        rotated = (self.points_rotated - self.align_centroid) @ self.R_align.T
+        # ------------------------------------------------------------------------------
+    
         vs      = self.voxel_size
         min_b   = rotated.min(axis=0)
         max_b   = rotated.max(axis=0)
-
+    
         x = np.arange(min_b[0], max_b[0], vs)
         y = np.arange(min_b[1], max_b[1], vs)
         z = np.arange(min_b[2], max_b[2], vs)
         xx, yy, zz         = np.meshgrid(x, y, z, indexing="ij")
         self.voxel_centers = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
-
+    
         self.log(f"Filtering {len(self.voxel_centers):,} candidate voxels (CUDA)...")
         mask             = self._filter_voxels_cuda(self.voxel_centers, rotated, vs * 1.5)
         remaining_voxels = self.voxel_centers[~mask]
-
+    
         pcd_tmp        = o3d.geometry.PointCloud()
         pcd_tmp.points = o3d.utility.Vector3dVector(remaining_voxels)
         self.remaining_voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
@@ -334,6 +354,8 @@ class LotusMesh:
 
     # ── Master pipeline ───────────────────────────────────────────────────────
 
+# ── Master pipeline ───────────────────────────────────────────────────────
+
     def execute(self):
         """Run the full pipeline and return the final Trimesh."""
         self.generate_and_filter_voxels()
@@ -347,6 +369,13 @@ class LotusMesh:
 
         self.log("Converting voxel mesh to Trimesh...")
         tm = self.o3d_to_trimesh(self.voxel_mesh)
+        
+        # --- EKLENEN KISIM: Üçgenlemeden sonra XY rotasyonunu geri al ---
+        # Not: Ray intersection eksenlere hizalı yönlere (+X, +Y, vs) ışın gönderdiği 
+        # için rotasyonu geri alma işlemi o basamaktan hemen sonra yapılmalıdır.
+        tm.vertices = tm.vertices @ self.R_align + self.align_centroid
+        # ----------------------------------------------------------------
+
         tm.merge_vertices(merge_tex=True, merge_norm=True)
         tm.update_faces(tm.nondegenerate_faces())
         tm.update_faces(tm.unique_faces())
@@ -459,7 +488,7 @@ def run_healing_stage(obj_path, voxel_size, log_fn=print):
         o3c.Tensor(np.concatenate([candidates, dirs_y], axis=1),
                    dtype=o3c.float32))['t_hit'].isfinite().numpy()
 
-    valid_points = candidates[hit_x | hit_y]
+    valid_points = candidates[hit_x & hit_y]
     log_fn(f"[Healing]   +X or +Y pass: {len(valid_points):,} / {n_cand:,}")
 
     if len(valid_points) == 0:
